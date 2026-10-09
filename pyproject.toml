@@ -1,0 +1,9 @@
+[project]
+name = "llmsim"
+version = "0.1.0"
+description = "Discrete-event simulator of vLLM-style LLM serving (continuous batching, paged KV cache) and capacity planner"
+requires-python = ">=3.10"
+dependencies = ["numpy", "matplotlib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
