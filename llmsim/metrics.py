@@ -14,7 +14,7 @@ def _pct(a, q):
     return float(np.percentile(a, q)) if len(a) else float("nan")
 
 
-def summarize(requests, slo: SLO, step_log, sim_end: float) -> dict:
+def summarize(requests, slo: SLO, step_log, sim_end: float, kv=None) -> dict:
     done = [r for r in requests if r.finish is not None]
     dropped = [r for r in requests if r.dropped]
     ttft = np.array([r.first_token - r.arrival for r in done])
@@ -33,7 +33,7 @@ def summarize(requests, slo: SLO, step_log, sim_end: float) -> dict:
     else:
         kv_mean = kv_max = 0.0
 
-    return {
+    res = {
         "n_requests": len(requests), "n_done": len(done), "n_dropped": len(dropped),
         "ttft_p50": _pct(ttft, 50), "ttft_p99": _pct(ttft, 99),
         "tpot_p50": _pct(tpot, 50), "tpot_p99": _pct(tpot, 99),
@@ -46,3 +46,12 @@ def summarize(requests, slo: SLO, step_log, sim_end: float) -> dict:
         "preemptions": sum(r.preemptions for r in requests),
         "sim_end_s": sim_end,
     }
+    if kv is not None and getattr(kv, "enable_prefix_caching", False):
+        res.update({
+            "prefix_lookups": kv.lookups,
+            "prefix_hits": kv.hits,
+            "prefix_hit_rate": kv.hit_rate,
+            "tokens_saved": kv.tokens_saved,
+            "prefix_evictions": kv.evictions,
+        })
+    return res

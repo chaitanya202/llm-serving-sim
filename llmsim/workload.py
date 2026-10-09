@@ -1,6 +1,6 @@
-"""Traffic profile: Poisson arrivals, lognormal prompt/output lengths."""
+"""Traffic profile: Poisson arrivals, lognormal prompt/output lengths, and optional shared prefixes."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 
@@ -10,6 +10,11 @@ class Request:
     arrival: float
     prompt_len: int
     output_len: int
+    # --- prefix caching metadata ---
+    prefix_id: int | None = None
+    prefix_len: int = 0
+    cached_tokens: int = 0
+    block_ids: list[int] = field(default_factory=list)
     # --- mutable simulation state ---
     computed: int = 0            # tokens whose KV is resident
     generated: int = 0
@@ -35,6 +40,10 @@ class WorkloadSpec:
     max_prompt: int = 8192
     max_output: int = 2048
     seed: int = 0
+    # Shared prefix settings for prefix caching evaluation
+    shared_prefix_len: int = 0
+    shared_prefix_ratio: float = 0.0
+    num_prefixes: int = 1
 
 
 def _lognormal(rng, mean, sigma, n, lo, hi):
@@ -45,8 +54,17 @@ def _lognormal(rng, mean, sigma, n, lo, hi):
 def generate(spec: WorkloadSpec) -> list[Request]:
     rng = np.random.default_rng(spec.seed)
     n = int(rng.poisson(spec.qps * spec.duration_s))
-    arrivals = np.sort(rng.uniform(0, spec.duration_s, n))  # Poisson process given count
+    arrivals = np.sort(rng.uniform(0, spec.duration_s, n))
     prompts = _lognormal(rng, spec.prompt_mean, spec.prompt_sigma, n, 1, spec.max_prompt)
     outputs = _lognormal(rng, spec.output_mean, spec.output_sigma, n, 1, spec.max_output)
-    return [Request(i, float(a), int(p), int(o))
-            for i, (a, p, o) in enumerate(zip(arrivals, prompts, outputs))]
+
+    reqs = []
+    for i, (a, p, o) in enumerate(zip(arrivals, prompts, outputs)):
+        r = Request(i, float(a), int(p), int(o))
+        if spec.shared_prefix_len > 0 and spec.shared_prefix_ratio > 0:
+            if rng.random() < spec.shared_prefix_ratio:
+                r.prefix_id = int(rng.integers(0, spec.num_prefixes))
+                r.prefix_len = min(int(p), spec.shared_prefix_len)
+        reqs.append(r)
+
+    return reqs

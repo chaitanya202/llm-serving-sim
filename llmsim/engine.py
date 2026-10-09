@@ -1,4 +1,4 @@
-"""Discrete-event serving engine: static vs continuous batching.
+"""Discrete-event serving engine: static vs continuous batching, with chunked prefill & prefix caching.
 
 Time advances step by step. Each step the scheduler picks work, the timing model
 says how long it takes, then request state is updated. When idle, the clock jumps
@@ -8,6 +8,7 @@ continuous: vLLM-style. Every step = 1 decode token for all running sequences +
             prefill (chunked, under a token budget) for newly admitted ones.
             KV blocks are allocated on demand; on exhaustion the youngest
             running request is preempted (recompute).
+            Supports optional prefix caching with LRU block eviction.
 static    : classic batching. Take up to max_batch requests, prefill them all,
             then decode until the *longest* finishes. Finished sequences keep
             their slot (padding), and arrivals wait for the next batch.
@@ -32,12 +33,13 @@ class EngineConfig:
     max_num_batched_tokens: int = 2048  # continuous: per-step token budget (chunked prefill)
     max_batch: int = 32                # static: batch size
     max_queue: int | None = None       # admission control: shed arrivals when queue is this long
+    enable_prefix_caching: bool = False # vLLM-style prefix caching with LRU eviction
 
 
 class Engine:
     def __init__(self, timing: TimingModel, cfg: EngineConfig):
         self.timing, self.cfg = timing, cfg
-        self.kv = BlockAllocator(cfg.num_blocks, cfg.block_size)
+        self.kv = BlockAllocator(cfg.num_blocks, cfg.block_size, enable_prefix_caching=cfg.enable_prefix_caching)
         self.step_log: list[tuple[float, float]] = []   # (dt, kv_util)
         self.t = 0.0
 
@@ -48,7 +50,7 @@ class Engine:
             self._run_continuous(reqs)
         else:
             self._run_static(reqs)
-        return summarize(reqs, slo, self.step_log, self.t)
+        return summarize(reqs, slo, self.step_log, self.t, kv=self.kv)
 
     # ----------------------------------------------------------------- helpers
     def _admit(self, reqs, i, waiting):
@@ -66,8 +68,29 @@ class Engine:
     def _log(self, dt):
         self.step_log.append((dt, self.kv.utilization))
 
+    def _allocate_for_request(self, r, need: int) -> list[int]:
+        """Allocates 'need' blocks, tagging with prefix keys if within the prefix range."""
+        cfg, kv = self.cfg, self.kv
+        bids = []
+        for _ in range(need):
+            prefix_key = None
+            if cfg.enable_prefix_caching and r.prefix_id is not None:
+                curr_blk_idx = len(r.block_ids) + len(bids)
+                if (curr_blk_idx + 1) * kv.block_size <= r.prefix_len:
+                    prefix_key = (r.prefix_id, curr_blk_idx)
+            bid = kv.allocate_one_block(prefix_key=prefix_key, current_time=self.t)
+            bids.append(bid)
+        return bids
+
     def _free(self, r):
-        self.kv.release(r.blocks); r.blocks = 0
+        if r.block_ids:
+            for bid in r.block_ids:
+                self.kv.release_block(bid, current_time=self.t)
+            r.block_ids.clear()
+            r.blocks = 0
+        elif r.blocks > 0:
+            self.kv.release(r.blocks)
+            r.blocks = 0
 
     def _preempt(self, r, waiting):
         """Recompute-style preemption: drop KV, redo prompt + generated tokens later."""
@@ -75,6 +98,7 @@ class Engine:
         # resident KV covered prompt + (generated - 1) tokens; recompute exactly that
         r.prefill_target = r.prompt_len + max(r.generated - 1, 0)
         r.computed = 0
+        r.cached_tokens = 0
         r.preemptions += 1
         waiting.appendleft(r)
 
@@ -113,7 +137,10 @@ class Engine:
                 if need > kv.free:                 # alone and still can't grow: give up
                     running.remove(r); self._free(r); r.dropped = True
                     continue
-                kv.allocate(need); r.blocks += need
+                if need > 0:
+                    new_bids = self._allocate_for_request(r, need)
+                    r.block_ids.extend(new_bids)
+                    r.blocks = len(r.block_ids)
                 decode.append(r); budget -= 1
 
             # 2) continue chunked prefills already in progress
@@ -122,18 +149,41 @@ class Engine:
                     chunk = min(r.prefill_target - r.computed, budget)
                     need = kv.blocks_for(r.computed + chunk) - r.blocks
                     if need <= kv.free:
-                        kv.allocate(need); r.blocks += need
+                        if need > 0:
+                            new_bids = self._allocate_for_request(r, need)
+                            r.block_ids.extend(new_bids)
+                            r.blocks = len(r.block_ids)
                         prefill.append((r, chunk)); budget -= chunk
 
             # 3) admit new requests (FIFO) while budget, slots and KV allow
             while waiting and budget > 0 and len(running) < cfg.max_num_seqs:
                 r = waiting[0]
+                # Match prefix cache on initial admission
+                if cfg.enable_prefix_caching and r.prefix_id is not None and r.computed == 0 and r.prefix_len > 0:
+                    matched_bids, matched_tokens = kv.match_prefix(r.prefix_id, r.prefix_len, self.t)
+                    if matched_bids:
+                        r.block_ids.extend(matched_bids)
+                        r.blocks = len(r.block_ids)
+                        r.computed = matched_tokens
+                        r.cached_tokens = matched_tokens
+
                 chunk = min(r.prefill_target - r.computed, budget)
-                need = kv.blocks_for(r.computed + chunk) - r.blocks
+                need = kv.blocks_for(r.computed + max(chunk, 1)) - r.blocks
                 if need > kv.free:
                     break                          # head-of-line: wait for memory
-                waiting.popleft(); kv.allocate(need); r.blocks += need
-                running.append(r); prefill.append((r, chunk)); budget -= chunk
+                waiting.popleft()
+                if need > 0:
+                    new_bids = self._allocate_for_request(r, need)
+                    r.block_ids.extend(new_bids)
+                    r.blocks = len(r.block_ids)
+                running.append(r)
+                if chunk > 0:
+                    prefill.append((r, chunk))
+                    budget -= chunk
+                else:
+                    # 100% prefix cache hit: immediately scheduled into decode step
+                    decode.append(r)
+                    budget -= 1
 
             if not decode and not prefill:         # nothing schedulable (memory stall)
                 if running:
@@ -150,6 +200,8 @@ class Engine:
 
             for r in decode:
                 r.computed += 1; r.generated += 1
+                if r.first_token is None:
+                    r.first_token = self.t
                 if r.generated >= r.output_len:
                     r.finish = self.t; running.remove(r); self._free(r)
             for r, chunk in prefill:
@@ -177,7 +229,11 @@ class Engine:
                 need = kv.blocks_for(r.prompt_len + r.output_len)   # reserve worst case
                 if need > kv.free:
                     break
-                waiting.popleft(); kv.allocate(need); r.blocks = need; batch.append(r)
+                waiting.popleft()
+                new_bids = self._allocate_for_request(r, need)
+                r.block_ids.extend(new_bids)
+                r.blocks = len(r.block_ids)
+                batch.append(r)
             if not batch:
                 waiting.popleft().dropped = True
                 continue
