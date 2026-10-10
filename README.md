@@ -1,29 +1,65 @@
-# llmsim — LLM serving simulator & capacity planner
+# llmsim — LLM Serving Simulator & Capacity Planner
 
-A discrete-event simulator of a vLLM-style inference engine (continuous batching,
-paged KV cache, chunked prefill, preemption, admission control) with a roofline
-timing model. Goal: answer *"how many GPUs for X QPS under an SLO?"* and show
-*why* (batching, KV memory, queueing), without needing a GPU to run.
+A discrete-event simulator and capacity planning engine of a modern GPU inference serving stack (**vLLM**-style: continuous batching, paged KV cache, chunked prefill, prefix caching, preemption) with a hardware roofline timing model.
 
-> **Status: Week 1 (core simulator).** Timing constants are **uncalibrated**
-> roofline estimates. Results show *relative* policy behavior, not validated
-> H100 numbers. Calibration and real-vLLM validation are planned (see Roadmap).
+**Core Mission**: Answer *"How many GPUs do I need to serve X requests/sec under strict latency SLOs?"* and demonstrate *why* (GPU compute FLOPs, HBM3 memory bandwidth, KV cache fragmentation, and queueing dynamics) without needing physical GPUs to run trials.
+
+---
+
+## 📚 Deep Dive Documentation
+
+For detailed architectural, low-level, and intuitive walk-throughs:
+- **[📖 Concepts & Hardware Intuition Guide](docs/CONCEPTS.md)**: A complete, beginner-friendly explanation of GPU Tensor Cores, FLOPs, HBM3 Bandwidth, Model Weights, Prefill vs. Decode, KV Caching, and Continuous Batching.
+- **[🏛️ High-Level Design (HLD)](docs/HLD.md)**: System architecture decomposition, component contracts, end-to-end request lifecycle, and Mermaid sequence diagrams.
+- **[⚙️ Low-Level Design (LLD)](docs/LLD.md)**: Algorithmic mechanics, data structures (`Block`, `BlockAllocator`, `Request`, `Engine`), $O(1)$ LRU eviction pool, and log-space Erlang-C mathematics.
+
+---
 
 ## Quick start
 ```bash
 pip install numpy matplotlib pytest
-PYTHONPATH=. python experiments/latency_vs_load.py   # writes results/*.png/csv
-python -m pytest -q
+PYTHONPATH=. python experiments/latency_vs_load.py       # Static vs Continuous batching
+PYTHONPATH=. python experiments/chunk_budget_sweep.py    # TTFT vs TPOT chunk sweep
+PYTHONPATH=. python experiments/prefix_caching_eval.py   # Prefix caching evaluation
+PYTHONPATH=. python experiments/capacity_planner_demo.py # Erlang-C vs Continuous batching
+python -m pytest tests/ -v                              # Run all 15 unit tests
 ```
 
-## What's modeled
-| Component | File | Notes |
+## System Architecture
+
+```
+                                  ┌───────────────────────────┐
+                                  │   Workload Generator      │
+                                  │   (Poisson + Lognormal)   │
+                                  └─────────────┬─────────────┘
+                                                │ Request Stream
+                                                ▼
+┌───────────────────────────┐     ┌───────────────────────────┐     ┌───────────────────────────┐
+│     Capacity Planner      │────▶│ Continuous Batching Engine│◀────│      KV Cache Manager     │
+│   (Erlang-C vs. vLLM)     │     │  (Chunked Prefill + Sched)│     │(PagedAttention + O(1) LRU)│
+└───────────────────────────┘     └─────────────┬─────────────┘     └───────────────────────────┘
+                                                │ Iteration Steps
+                                                ▼
+                                  ┌───────────────────────────┐
+                                  │   Roofline Timing Model   │
+                                  │ (FLOPs Peak vs HBM3 BW)   │
+                                  └─────────────┬─────────────┘
+                                                │ Execution Times
+                                                ▼
+                                  ┌───────────────────────────┐
+                                  │    Metrics & SLO Engine   │
+                                  │ (TTFT, TPOT, Goodput P99) │
+                                  └───────────────────────────┘
+```
+
+| Component | File | Responsibility |
 |---|---|---|
-| Workload | `workload.py` | Poisson arrivals, lognormal prompt/output lengths |
-| Timing | `timing.py` | `max(FLOPs/peak, bytes/BW) + overhead` per fused step; weights + KV reads dominate decode |
-| KV cache | `kvcache.py` | Block allocator (16 tok/block); capacity derived from GPU mem − weights |
-| Engine | `engine.py` | `continuous` (token budget, chunked prefill, recompute preemption) and `static` (padded batches) |
-| Metrics | `metrics.py` | TTFT, TPOT, throughput, **goodput under SLO**, KV utilization |
+| **Workload** | `llmsim/workload.py` | Poisson arrivals, lognormal prompt/output token distributions, shared prefixes. |
+| **Timing** | `llmsim/timing.py` | Roofline physics: $\max(\text{FLOPs/peak}, \text{bytes/BW}) + \text{overhead}$; weights + KV reads dominate decode. |
+| **KV Cache** | `llmsim/kvcache.py` | PagedAttention allocator (16 tok/block), 64-bit cryptographic hashing, $O(1)$ `OrderedDict` LRU pool. |
+| **Engine** | `llmsim/engine.py` | Continuous batching runtime, token-budget chunked prefill, recompute preemption. |
+| **Metrics** | `llmsim/metrics.py` | Telemetry tracker: TTFT, TPOT, tail latencies (P50, P90, P99), and **goodput under SLO**. |
+| **Planner** | `llmsim/planner.py` | Telecom Erlang-C ($M/M/c$) solver, traffic intensity ($A = \lambda \cdot E[S]$), cluster sizing divergence. |
 
 ## First result: static vs continuous batching
 Llama-3-8B, 1×H100, prompt≈512, output≈200, SLO: TTFT<500 ms and TPOT<50 ms.
