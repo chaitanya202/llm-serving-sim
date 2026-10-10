@@ -56,7 +56,7 @@ python -m pytest tests/ -v                              # Run all 15 unit tests
 |---|---|---|
 | **Workload** | `llmsim/workload.py` | Poisson arrivals, lognormal prompt/output token distributions, shared prefixes. |
 | **Timing** | `llmsim/timing.py` | Roofline physics: $\max(\text{FLOPs/peak}, \text{bytes/BW}) + \text{overhead}$; weights + KV reads dominate decode. |
-| **KV Cache** | `llmsim/kvcache.py` | PagedAttention allocator (16 tok/block), 64-bit cryptographic hashing, $O(1)$ `OrderedDict` LRU pool. |
+| **KV Cache** | `llmsim/kvcache.py` | PagedAttention allocator (16 tok/block), 64-bit block hashing, $O(1)$ `OrderedDict` LRU pool. |
 | **Engine** | `llmsim/engine.py` | Continuous batching runtime, token-budget chunked prefill, recompute preemption. |
 | **Metrics** | `llmsim/metrics.py` | Telemetry tracker: TTFT, TPOT, tail latencies (P50, P90, P99), and **goodput under SLO**. |
 | **Planner** | `llmsim/planner.py` | Telecom Erlang-C ($M/M/c$) solver, traffic intensity ($A = \lambda \cdot E[S]$), cluster sizing divergence. |
@@ -105,52 +105,72 @@ Run: `PYTHONPATH=. python experiments/prefix_caching_eval.py`
 | **75%** | 99.8% | 145,872 | 144.6 ms | 84.4 ms | **-41.6%** |
 | **100%** | 99.8% | 191,328 | 144.6 ms | 83.0 ms | **-42.6%** |
 
-- **Compute & Latency Payoff**: Prefix caching slashes P99 TTFT by over **42%** on multi-turn conversations while completely eliminating redundant prefill FLOPs for shared system prompts.
+- **Compute & Latency Payoff**: Prefix caching slashes P99 TTFT by over **42%** on workloads with a shared system prompt while completely eliminating redundant prefill FLOPs.
 - **Memory Safety**: Unreferenced cached blocks reside in an $O(1)$ `OrderedDict` LRU pool, evicting seamlessly when physical KV capacity saturates.
 
-## Fourth result: capacity planner (Erlang-C vs continuous batching divergence)
-Capacity planning comparing classical telecom Erlang-C ($M/M/c$) queueing theory against continuous batching simulation (Llama-3-8B on H100 SXM, prompt≈512, output≈200, 100 QPS target, SLO: TTFT<500 ms & TPOT<50 ms).
+## Fourth result: capacity planner (Erlang-C vs continuous batching)
+
+Compares Erlang-C ($M/M/c$) sizing against the continuous-batching simulation.
+Llama-3-8B on H100 SXM, prompt≈512, output≈200, 100 QPS target,
+SLO: TTFT<500 ms and TPOT<50 ms. **Simulation only, constants unvalidated
+against real hardware (see Known limitations).**
+Config: `max_num_seqs = 256`, chunk budget = 512, routing = uniform Poisson splitting ($\lambda / N$).
 Run: `PYTHONPATH=. python experiments/capacity_planner_demo.py`
 
 ![capacity planner](results/capacity_planner.png)
 
-### Key findings:
-| Sizing Model | Target QPS | Offered Traffic | Minimum GPUs | P99 TTFT | P99 TPOT | Sizing Dynamic |
-| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Naive Erlang-C ($M/M/c$)** | 100 | 149.5 Erlangs | **161 GPUs** | < 500 ms | ~7.4 ms | **53.7x Over-provisioning**: Assumes 1 isolated request per server ($c=1$). Ignores batching concurrency. |
-| **Slotted Erlang-C (32 slots/GPU)** | 100 | 149.5 Erlangs | **5 GPUs** | 500.2 ms | Assumes constant | **Under-estimates Capacity**: Assumes service time is load-independent; misses dynamic KV multiplexing. |
-| **Continuous Batching (vLLM)** | 100 | 149.5 Erlangs | **3 GPUs** | **262.6 ms** | **24.7 ms** | **Optimal Real-World Sizing**: PagedAttention multiplexes sequences dynamically, easily beating static slot limits. |
+| Sizing model | Min GPUs | P99 latency metric | P99 TPOT | Notes |
+| --- | --- | --- | --- | --- |
+| **Single-request-per-GPU Erlang-C ($c = N$)** | 161 | queue wait < 500 ms | ~7.4 ms | Strawman for contrast, not how anyone serves LLMs. Offered load 149.5 Erlangs. ~$4.8M at an assumed ~$30k per GPU. |
+| **Slotted Erlang-C (32 slots/GPU, $c = 32N$)** | 5 | queue wait 500.2 ms | not modeled | Asks for more GPUs than the simulation needs (5 vs 3). Depends on the slot count, which is a free parameter. |
+| **Simulation (continuous batching)** | 3 | TTFT 262.6 ms | 24.7 ms | Sizing knee: 2 GPUs fail the SLO. Runs near saturation with no redundancy or burst headroom. |
 
-### Cluster Scaling & Memory Bandwidth Inflation (100 QPS Workload):
-| GPUs in Cluster | Offered QPS/GPU | Slotted Erlang-C P99 | Sim P99 TTFT | Sim P99 TPOT | Peak KV Util | SLO Status |
+### Cluster scaling (100 QPS workload)
+
+| GPUs in Cluster | Offered QPS/GPU | Slotted Erlang-C P99 queue wait (ms) | Sim P99 TTFT (ms) | Sim P99 TPOT (ms) | Peak KV Util | SLO Status |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **2** | 50.0 | Overloaded | 2,206.4 ms | 49.3 ms | 38.9% | FAIL (TTFT Exceeded) |
-| **3** | 33.3 | Overloaded | **262.6 ms** | **24.7 ms** | 23.9% | **PASS (Sizing Knee)** |
-| **4** | 25.0 | Overloaded | 131.9 ms | 18.7 ms | 12.5% | PASS |
-| **5** | 20.0 | 500.2 ms | 117.1 ms | 14.4 ms | 9.4% | PASS |
-| **6** | 16.7 | 17.6 ms | 135.2 ms | 13.8 ms | 6.7% | PASS |
-| **8** | 12.5 | 17.6 ms | 125.8 ms | 12.2 ms | 6.3% | PASS |
-| **10** | 10.0 | 17.6 ms | 126.8 ms | 11.5 ms | 5.4% | PASS |
+| **2** | 50.0 | Overloaded | 2,206.4 | 49.3 | 38.9% | FAIL (TTFT Exceeded) |
+| **3** | 33.3 | Overloaded | **262.6** | **24.7** | 23.9% | **PASS (Sizing Knee)** |
+| **4** | 25.0 | Overloaded | 131.9 | 18.7 | 12.5% | PASS |
+| **5** | 20.0 | 500.2 | 117.1 | 14.4 | 9.4% | PASS |
+| **6** | 16.7 | 17.6 | 135.2 | 13.8 | 6.7% | PASS |
+| **8** | 12.5 | 17.6 | 125.8 | 12.2 | 6.3% | PASS |
+| **10** | 10.0 | 17.6 | 126.8 | 11.5 | 5.4% | PASS |
 
-- **The Consolidation Dividend**: Continuous batching delivers a **53.7x hardware reduction** (161 GPUs down to 3 GPUs) compared to classical single-channel queueing theory.
-- **Why Erlang-C Breaks Down on GPUs**:
-  1. *Under-provisioning via Load-Independent Assumptions*: Classical $M/M/c$ assumes service time $E[S]$ is constant regardless of how many slots are occupied. On GPUs, decode step time is bound by HBM3 memory bandwidth reading weights and active KV blocks. As cluster size shrinks from 10 to 2 GPUs, concurrent batch load inflates P99 TPOT by **4.3x** (from 11.5 ms up to 49.3 ms).
-  2. *Over-provisioning via Fixed Slotting*: Slotted Erlang-C declared 3 and 4 GPUs "overloaded" because 96 static slots $< 149.5$ Erlangs. In reality, continuous batching dynamically interleaves sequences beyond static batch slots, operating stably at 23.9% peak KV cache utilization.
+*(Note: Slotted Erlang-C reports queue wait alone, whereas simulation reports TTFT which includes queue wait plus prefill).*
+
+### Findings
+
+- **Against the single-request-per-GPU baseline** the simulation needs 3 GPUs instead of 161 (53.7x). That baseline is a strawman. Against slotted Erlang-C the gap is 5 vs 3 GPUs (1.7x), and it depends on the slot count.
+- **Service time is not load-independent.** P99 TPOT is 11.5 ms at 10 GPUs, 24.7 ms at the passing 3-GPU knee (2.1x), and 49.3 ms at 2 GPUs, which fails the TTFT SLO (4.3x). Whether the rise comes from KV/weight reads or from prefill chunks sharing steps with decode has not been decomposed yet (see Roadmap).
+- **Fixed slots are arbitrary.** 96 slots < 149.5 Erlangs, so slotted Erlang-C calls 3 GPUs overloaded while the simulation passes at 23.9% peak KV utilization. A different slot count would change this result.
+- **Batching trades per-token latency for cost.** The 161-GPU cluster has ~7.4 ms TPOT vs 24.7 ms at 3 GPUs.
+- **At 3 GPUs (33.3 QPS per GPU)**, the workload operates right at the passing knee ($\approx 262\text{ ms} \le 500\text{ ms}$ SLO) before the steep queueing cliff observed at 40+ QPS on single-GPU runs.
 
 ## Known limitations (read before quoting numbers)
+- Results are simulated and not yet validated against real vLLM.
+- Arrivals are Poisson only. Real traffic is burstier, which raises the GPU count needed for the same tail latency.
+- Sizing finds the minimum GPUs that pass the SLO. It includes no N+1 redundancy and no utilization headroom.
+- Slotted Erlang-C results depend on the chosen slot count (32 here).
+- Erlang-C reports queue wait. The simulation reports TTFT (queue wait plus prefill). They are not the same metric.
+- The ~$30k per GPU figure is an assumption, and excludes host, networking, and power.
 - Roofline efficiencies (`bw_eff=0.75`, `flops_eff=0.5`, 1 ms step overhead) are assumptions.
 - Attention FLOPs, tensor-parallel communication, and activation memory are ignored.
-- The static-batching baseline is deliberately classic (padding until the longest
-  sequence finishes); it is a lower bound on what naive serving looks like.
-- Rates (goodput, throughput) divide by total simulated time including queue drain,
-  so overloaded points are pessimistic.
+- The static-batching baseline is deliberately classic (padding until the longest sequence finishes); it is a lower bound on what naive serving looks like.
+- Rates (goodput, throughput) divide by total simulated time including queue drain, so overloaded points are pessimistic.
 - Preemption is recompute-style only (no swap-to-CPU).
 
 ## Roadmap
 - [x] Prefix caching (block hashing + LRU) and its hit-rate/TTFT effect
 - [x] Sweep `max_num_batched_tokens` (chunk size) — TTFT vs TPOT tradeoff
 - [x] Capacity planner: roofline + queueing model (Erlang-C first-order, show where it diverges)
+- [ ] Decompose P99 TPOT into decode-only steps vs steps shared with prefill chunks, to attribute the 11.5 -> 49.3 ms rise
+- [ ] Sweep slotted Erlang-C slot count (16, 32, 64, 128, 256) vs simulation
+- [ ] Reconcile the first-result saturation (~30-40 QPS/GPU) with the 33.3 QPS/GPU pass at 3 GPUs in the capacity planner
+- [ ] Headroom-aware sizing (N+1, target utilization <= 70-80%)
+- [ ] Bursty arrivals (gamma / MMPP) in addition to Poisson
 - [ ] Calibrate timing model against llama.cpp on CPU (validates *method*, not H100 constants)
 - [ ] One-hour real-vLLM run on a rented GPU to validate p99 TTFT prediction
 - [ ] Compare against Vidur and cite differences
+
 
