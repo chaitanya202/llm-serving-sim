@@ -1,17 +1,15 @@
-# llmsim — LLM Serving Simulator & Capacity Planner
+# llmsim — LLM serving simulator & capacity planner
 
-A discrete-event simulator and capacity planning engine of a modern GPU inference serving stack (**vLLM**-style: continuous batching, paged KV cache, chunked prefill, prefix caching, preemption) with a hardware roofline timing model.
+A discrete-event simulator of a vLLM-style inference engine (continuous batching,
+paged KV cache, chunked prefill, prefix caching, preemption) with a hardware
+roofline timing model. Built to model serving dynamics (compute FLOPs, HBM3
+bandwidth, KV cache memory pressure, queueing) and evaluate GPU cluster sizing
+under latency SLOs.
 
-**Core Mission**: Answer *"How many GPUs do I need to serve X requests/sec under strict latency SLOs?"* and demonstrate *why* (GPU compute FLOPs, HBM3 memory bandwidth, KV cache fragmentation, and queueing dynamics) without needing physical GPUs to run trials.
-
----
-
-## 📚 Deep Dive Documentation
-
-For detailed architectural, low-level, and intuitive walk-throughs:
-- **[📖 Concepts & Hardware Intuition Guide](docs/CONCEPTS.md)**: A complete, beginner-friendly explanation of GPU Tensor Cores, FLOPs, HBM3 Bandwidth, Model Weights, Prefill vs. Decode, KV Caching, and Continuous Batching.
-- **[🏛️ High-Level Design (HLD)](docs/HLD.md)**: System architecture decomposition, component contracts, end-to-end request lifecycle, and Mermaid sequence diagrams.
-- **[⚙️ Low-Level Design (LLD)](docs/LLD.md)**: Algorithmic mechanics, data structures (`Block`, `BlockAllocator`, `Request`, `Engine`), $O(1)$ LRU eviction pool, and log-space Erlang-C mathematics.
+## Documentation
+- [Concepts & Hardware Intuition](docs/CONCEPTS.md): Notes on Tensor Cores, FLOPs, HBM3 memory bandwidth, KV caching, and continuous batching.
+- [High-Level Design (HLD)](docs/HLD.md): Subsystem roles, component contracts, and request lifecycle flows.
+- [Low-Level Design (LLD)](docs/LLD.md): Block layout, $O(1)$ LRU eviction pool, scheduler loop, and log-space Erlang-C math.
 
 ---
 
@@ -80,15 +78,15 @@ Run: `PYTHONPATH=. python experiments/chunk_budget_sweep.py`
 ![chunk budget sweep](results/chunk_budget_sweep.png)
 
 ### Key findings:
-| Chunk Budget | P99 TTFT (QPS=30) | P99 TPOT (QPS=30) | P99 Step Forward-Pass Latency | Trade-Off Dynamic |
+| Chunk Budget | P99 TTFT (QPS=30) | P99 TPOT (QPS=30) | P99 Step Forward-Pass Latency | Notes |
 | :---: | :---: | :---: | :---: | :--- |
-| **256** | 341.1 ms | **10.1 ms** | **10.1 ms** | **Smooth Decode, High TTFT**: 512-tok prompts split across multiple steps. |
+| **256** | 341.1 ms | **10.1 ms** | **10.1 ms** | Prompts split across multiple steps; decode stays fast. |
 | **512** | 215.0 ms | 15.8 ms | 17.6 ms | Balanced prefill and decode stepping. |
-| **1024** | **187.1 ms** | 20.6 ms | 34.3 ms | **Optimal TTFT Sweet Spot**: Prompt finishes in 1-2 steps; step time remains moderate. |
-| **2048** | 198.7 ms | 24.8 ms | 67.5 ms | Heavy compute prefill steps begin delaying concurrent decode tokens. |
-| **4096+** | 211.0 ms | 25.3 ms | 75.5 ms | **Decode Jitter Penalty**: Massive forward-pass bursts inflate TPOT by **2.5x**. |
+| **1024** | **187.1 ms** | 20.6 ms | 34.3 ms | Lowest TTFT in this setup; step duration remains bounded. |
+| **2048** | 198.7 ms | 24.8 ms | 67.5 ms | Heavier prefill steps begin delaying concurrent decodes. |
+| **4096+** | 211.0 ms | 25.3 ms | 75.5 ms | Large prefill bursts delay running decodes, raising TPOT 2.5x. |
 
-- **The Sweet Spot**: For Llama-3-8B on an H100 with ~512 token prompts, `max_num_batched_tokens = 512..1024` yields the Pareto optimal trade-off between prompt responsiveness (TTFT) and decode smoothness (TPOT).
+- For Llama-3-8B on an H100 with ~512-token prompts, `max_num_batched_tokens = 512..1024` gave the lowest TTFT without causing decode jitter.
 
 ## Third result: prefix caching evaluation (shared system prompt / RAG)
 Evaluation of PagedAttention prefix caching with $O(1)$ LRU block eviction across shared prefix ratios (0% to 100%, 384-token shared system prompt, QPS=25).
@@ -105,8 +103,8 @@ Run: `PYTHONPATH=. python experiments/prefix_caching_eval.py`
 | **75%** | 99.8% | 145,872 | 144.6 ms | 84.4 ms | **-41.6%** |
 | **100%** | 99.8% | 191,328 | 144.6 ms | 83.0 ms | **-42.6%** |
 
-- **Compute & Latency Payoff**: Prefix caching slashes P99 TTFT by over **42%** on workloads with a shared system prompt while completely eliminating redundant prefill FLOPs.
-- **Memory Safety**: Unreferenced cached blocks reside in an $O(1)$ `OrderedDict` LRU pool, evicting seamlessly when physical KV capacity saturates.
+- Prefix caching reduced P99 TTFT by 42.6% on workloads with a shared system prompt and eliminated redundant prefill FLOPs.
+- Unreferenced cached blocks sit in an $O(1)$ `OrderedDict` LRU pool and evict when physical KV capacity fills.
 
 ## Fourth result: capacity planner (Erlang-C vs continuous batching)
 
